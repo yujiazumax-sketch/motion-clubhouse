@@ -1,0 +1,12 @@
+# PoC 解析用（Python 3.10+）
+numpy>=1.26
+scipy>=1.11
+opencv-python-headless>=4.9
+Pillow>=10
+librosa>=0.10
+soundfile>=0.12
+matplotlib>=3.8
+# 任意（Phase 1 後半で検討）
+# mediapipe        # 人物GIFの姿勢推定
+# madmom           # ダウンビート推定（Python/numpy バージョン相性に注意）
+# beat_this        # Transformer ベースのビート/ダウンビート推定 (ISMIR 2024)

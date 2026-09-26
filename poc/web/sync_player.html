@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sync Player PoC</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --muted:#999; --accent:#ffcc33; --accent2:#4fd1c5; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, sans-serif; }
+  h1 { font-size:18px; margin:0 0 8px; }
+  p.lead { color:var(--muted); margin:0 0 16px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:8px 16px; max-width:900px; }
+  label { display:flex; flex-direction:column; gap:2px; font-size:12px; color:var(--muted); }
+  input, select, textarea, button { font:inherit; background:#1e1e1e; color:var(--fg); border:1px solid #333; border-radius:6px; padding:6px 8px; }
+  textarea { grid-column: 1 / -1; min-height:56px; font-family: ui-monospace, monospace; font-size:12px; }
+  button { cursor:pointer; background:#2a2a2a; }
+  button.primary { background:var(--accent); color:#111; font-weight:600; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0; }
+  .stage { display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap; margin-top:12px; }
+  canvas { background:#000; border-radius:8px; max-width:100%; }
+  .dots { display:flex; gap:16px; align-items:center; }
+  .dot { width:36px; height:36px; border-radius:50%; background:#333; transition: background 60ms; }
+  .dot.on { background:var(--accent); box-shadow:0 0 24px var(--accent); }
+  .dot.on.impact { background:var(--accent2); box-shadow:0 0 24px var(--accent2); }
+  .dotlabel { font-size:11px; color:var(--muted); text-align:center; }
+  pre { background:#181818; padding:8px; border-radius:6px; font-size:12px; max-width:900px; overflow:auto; }
+  .warn { color:#ff7b7b; }
+</style>
+</head>
+<body>
+<h1>Sync Player PoC — 音楽のビートに GIF の動きを同期</h1>
+<p class="lead">GIF をフレーム分解し、AudioContext の時計に合わせて Canvas に描画する。再生速度をわずかに伸縮し、視覚ビート（方向転換の瞬間）を拍に合わせる。Chrome / Edge 推奨（ImageDecoder API を使用）。</p>
+
+<div class="grid">
+  <label>音楽ファイル <input type="file" id="audioFile" accept="audio/*"></label>
+  <label>GIF ファイル <input type="file" id="gifFile" accept="image/gif"></label>
+  <label>音楽 BPM <input type="number" id="bpm" value="120" step="0.01" min="30" max="300"></label>
+  <label>拍の位相 beat_phase (s) — 楽曲内でビートが鳴る時刻のひとつ <input type="number" id="beatPhase" value="0" step="0.001"></label>
+  <label>GIF の周期 cycle_period_s（gif_period.py の cycle_period_s または impact_period_s） <input type="number" id="cyclePeriod" step="0.0001" placeholder="例: 0.5"></label>
+  <label>1周期あたりの拍数 beats_per_cycle
+    <select id="beatsPerCycle">
+      <option value="auto" selected>auto（伸縮が最小になる倍率を選ぶ）</option>
+      <option value="0.25">0.25</option><option value="0.5">0.5</option><option value="1">1</option><option value="2">2</option><option value="4">4</option>
+    </select>
+  </label>
+  <label>位相オフセット phase_offset_s（GIF 内で拍に合わせたい瞬間。impact_offsets_s[0]） <input type="number" id="phaseOffset" value="0" step="0.001"></label>
+  <label>モード
+    <select id="mode">
+      <option value="synced" selected>同期（伸縮 + 位相合わせ）</option>
+      <option value="stretch">伸縮のみ（位相は合わせない）</option>
+      <option value="raw">元速度（A/B 比較用）</option>
+    </select>
+  </label>
+  <textarea id="analysisJson" placeholder="任意: gif_period.py の JSON をここに貼ると周期・位相を自動入力"></textarea>
+</div>
+
+<div class="row">
+  <button id="play" class="primary">▶ 再生</button>
+  <button id="stop">■ 停止</button>
+  <button id="tap">TAP — 音楽に合わせて拍を叩く（BPM と位相を取る）</button>
+  <span id="tapInfo" class="muted"></span>
+</div>
+
+<div class="stage">
+  <canvas id="cv" width="320" height="240"></canvas>
+  <div class="dots">
+    <div><div class="dot" id="beatDot"></div><div class="dotlabel">音の拍</div></div>
+    <div><div class="dot" id="impactDot"></div><div class="dotlabel">GIF の視覚ビート</div></div>
+  </div>
+</div>
+<pre id="status">未ロード</pre>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const state = {
+  audioCtx: null, audioBuffer: null, source: null, t0: null,   // t0 = 音楽開始時の audioCtx.currentTime
+  frames: [], durations: [], cum: [], loopT: 0, gifName: '',
+  taps: [], lastBeatIdx: -1, lastImpactIdx: -1, lastLoopIdx: -1, raf: 0, drawCount: 0, wraps: 0,
+  // 直近の描画状態（テストや確認用）
+  tau: 0, g: 0, frame: -1, rate: 1, m: 1, errors: [],
+};
+window.__poc = state;
+
+function log(msg, isErr) {
+  if (isErr) state.errors.push(msg);
+  render();
+  console[isErr ? 'error' : 'log'](msg);
+}
+
+// ---------- GIF デコード (ImageDecoder / WebCodecs) ----------
+async function loadGif(file) {
+  if (!('ImageDecoder' in window)) {
+    log('このブラウザは ImageDecoder 未対応。Chrome/Edge を使うか gifuct-js 等でデコードしてください。', true);
+    return;
+  }
+  const buf = await file.arrayBuffer();
+  const dec = new ImageDecoder({ data: buf, type: 'image/gif' });
+  await dec.tracks.ready;
+  const track = dec.tracks.selectedTrack;
+  const n = track.frameCount;
+  const frames = [], durations = [];
+  for (let i = 0; i < n; i++) {
+    const { image } = await dec.decode({ frameIndex: i });
+    let d = (image.duration || 0) / 1e6;                 // μs → s
+    if (d <= 0.011) d = 0.1;                             // ブラウザ実装と同じ: 極小ディレイは 100ms
+    frames.push(await createImageBitmap(image));
+    durations.push(d);
+    image.close();
+  }
+  dec.close();
+  const cum = [0];
+  for (const d of durations) cum.push(cum[cum.length - 1] + d);
+  state.frames = frames; state.durations = durations; state.cum = cum; state.loopT = cum[n]; state.gifName = file.name;
+  const cv = $('cv'); cv.width = frames[0].width; cv.height = frames[0].height;
+  if (!$('cyclePeriod').value) $('cyclePeriod').value = state.loopT.toFixed(4);   // 未指定ならループ1周=1周期
+  log(`GIF: ${file.name} ${n} frames, loop ${state.loopT.toFixed(3)} s`);
+}
+
+function frameIndexAt(g) {               // g: GIF 内時刻 [0, loopT)
+  const cum = state.cum;
+  let lo = 0, hi = cum.length - 2;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (cum[mid] <= g) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+
+// ---------- 音楽 ----------
+async function loadAudio(file) {
+  if (!state.audioCtx) state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await file.arrayBuffer();
+  state.audioBuffer = await state.audioCtx.decodeAudioData(buf);
+  log(`audio: ${file.name} ${state.audioBuffer.duration.toFixed(1)} s`);
+}
+
+function play() {
+  if (!state.audioBuffer) { log('音楽ファイルを選んでください', true); return; }
+  if (!state.frames.length) { log('GIF ファイルを選んでください', true); return; }
+  stop();
+  const ctx = state.audioCtx;
+  ctx.resume();
+  const src = ctx.createBufferSource();
+  src.buffer = state.audioBuffer; src.loop = true; src.connect(ctx.destination);
+  state.t0 = ctx.currentTime + 0.05;
+  src.start(state.t0);
+  state.source = src;
+  state.lastBeatIdx = -1; state.lastImpactIdx = -1; state.lastLoopIdx = -1; state.drawCount = 0; state.wraps = 0;
+  tick();
+}
+
+function stop() {
+  if (state.source) { try { state.source.stop(); } catch (e) {} state.source = null; }
+  cancelAnimationFrame(state.raf);
+}
+
+// ---------- 同期パラメータ ----------
+const MULT = [1, 2, 0.5, 4, 0.25], PREF = { 1: 1.0, 2: 0.9, 0.5: 0.9, 4: 0.75, 0.25: 0.75 };
+function chooseMultiplier(period, beat, maxStretch = 0.15) {
+  const sel = $('beatsPerCycle').value;
+  if (sel !== 'auto') return parseFloat(sel);
+  let best = null, bestFit = -1;
+  for (const m of MULT) {
+    const dev = Math.abs(Math.log(period / (m * beat)));
+    const lim = Math.log(1 + maxStretch);
+    const fit = (1 - dev / lim) * PREF[m];
+    if (dev <= lim && fit > bestFit) { best = m; bestFit = fit; }
+  }
+  return best ?? 1;
+}
+
+function params() {
+  const bpm = parseFloat($('bpm').value) || 120;
+  const beat = 60 / bpm;
+  const period = parseFloat($('cyclePeriod').value) || state.loopT || 1;
+  const m = chooseMultiplier(period, beat);
+  const mode = $('mode').value;
+  const rate = mode === 'raw' ? 1 : period / (m * beat);
+  return { bpm, beat, period, m, rate, mode,
+           beatPhase: parseFloat($('beatPhase').value) || 0,
+           phaseOffset: parseFloat($('phaseOffset').value) || 0 };
+}
+
+// ---------- 描画ループ ----------
+function tick() {
+  state.raf = requestAnimationFrame(tick);
+  if (!state.source) return;
+  const p = params();
+  const tau = state.audioCtx.currentTime - state.t0;            // 楽曲内時刻（ループ再生なので単調増加）
+  if (tau < 0) return;
+  let gU;                                                        // 伸縮後の GIF 内時刻（unwrapped, 単調増加）
+  if (p.mode === 'synced') gU = (tau - p.beatPhase) * p.rate + p.phaseOffset;   // 拍で gU ≡ phaseOffset (mod period)
+  else gU = tau * p.rate;
+  const T = state.loopT;
+  const g = ((gU % T) + T) % T;
+  const idx = frameIndexAt(g);
+  if (idx !== state.frame) {
+    const cv = $('cv'); cv.getContext('2d').drawImage(state.frames[idx], 0, 0);
+    state.drawCount++;
+  }
+  const loopIdx = Math.floor(gU / T);
+  if (state.lastLoopIdx >= 0 && loopIdx !== state.lastLoopIdx) state.wraps++;
+  state.lastLoopIdx = loopIdx;
+  state.tau = tau; state.g = g; state.frame = idx; state.rate = p.rate; state.m = p.m;
+
+  // 音の拍インジケータ
+  const beatIdx = Math.floor((tau - p.beatPhase) / p.beat);
+  if (beatIdx !== state.lastBeatIdx) { state.lastBeatIdx = beatIdx; flash($('beatDot'), ''); }
+  // GIF の視覚ビート: gU が phaseOffset + k*period を通過した瞬間
+  const cycleIdx = Math.floor((gU - p.phaseOffset) / p.period);
+  if (cycleIdx !== state.lastImpactIdx) { state.lastImpactIdx = cycleIdx; flash($('impactDot'), 'impact'); }
+  render();
+}
+
+function flash(el, cls) { el.classList.add('on'); if (cls) el.classList.add(cls); setTimeout(() => el.classList.remove('on', 'impact'), 90); }
+
+function render() {
+  const p = params();
+  const beatsPerLoop = state.loopT ? (state.loopT / p.rate) / p.beat : 0;
+  $('status').textContent =
+`GIF: ${state.gifName || '-'}  frames=${state.frames.length} loop=${state.loopT.toFixed(3)}s
+音楽: ${state.audioBuffer ? state.audioBuffer.duration.toFixed(1) + 's' : '-'}  BPM=${p.bpm}  拍間隔=${p.beat.toFixed(4)}s  位相=${p.beatPhase}
+モード=${p.mode}  周期=${p.period}s  beats/cycle=${p.m}  rate=${p.rate.toFixed(4)} (${((p.rate - 1) * 100).toFixed(1)}%)  beats/loop=${beatsPerLoop.toFixed(2)}
+再生位置 τ=${state.tau.toFixed(3)}s  GIF内時刻 g=${state.g.toFixed(3)}s  frame=${state.frame}
+${state.errors.length ? 'ERR: ' + state.errors.join(' | ') : ''}`;
+}
+
+// ---------- TAP テンポ ----------
+function tap() {
+  if (!state.source) return;
+  const tau = state.audioCtx.currentTime - state.t0;
+  state.taps.push(tau);
+  if (state.taps.length > 8) state.taps.shift();
+  if (state.taps.length >= 2) {
+    const d = []; for (let i = 1; i < state.taps.length; i++) d.push(state.taps[i] - state.taps[i - 1]);
+    d.sort((a, b) => a - b);
+    const med = d[Math.floor(d.length / 2)];
+    const bpm = 60 / med;
+    if (bpm > 30 && bpm < 300) { $('bpm').value = bpm.toFixed(2); }
+  }
+  $('beatPhase').value = tau.toFixed(3);
+  $('tapInfo').textContent = `taps=${state.taps.length} → BPM ${$('bpm').value}, 位相 ${$('beatPhase').value}s`;
+}
+
+// ---------- 解析 JSON の取り込み ----------
+function applyAnalysis(text) {
+  let j; try { j = JSON.parse(text); } catch (e) { return; }
+  if (Array.isArray(j)) j = j[0];
+  if (j.cycle_period_s) $('cyclePeriod').value = j.cycle_period_s;
+  if (j.impact_offsets_s && j.impact_offsets_s.length) $('phaseOffset').value = j.impact_offsets_s[0];
+  if (j.rate && j.beats_per_cycle) { $('beatsPerCycle').value = String(j.beats_per_cycle); }   // match.py の出力にも対応
+  if (j.phase_offset_s != null) $('phaseOffset').value = j.phase_offset_s;
+  log(`analysis JSON applied: period=${$('cyclePeriod').value} offset=${$('phaseOffset').value}`);
+}
+
+$('audioFile').addEventListener('change', e => e.target.files[0] && loadAudio(e.target.files[0]).catch(err => log('audio load failed: ' + err, true)));
+$('gifFile').addEventListener('change', e => e.target.files[0] && loadGif(e.target.files[0]).catch(err => log('gif load failed: ' + err, true)));
+$('play').addEventListener('click', play);
+$('stop').addEventListener('click', stop);
+$('tap').addEventListener('click', tap);
+document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') { e.preventDefault(); tap(); } });
+$('analysisJson').addEventListener('input', e => applyAnalysis(e.target.value));
+for (const id of ['bpm', 'beatPhase', 'cyclePeriod', 'beatsPerCycle', 'phaseOffset', 'mode']) $(id).addEventListener('input', render);
+render();
+</script>
+</body>
+</html>
